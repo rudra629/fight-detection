@@ -1,118 +1,173 @@
-import streamlit as st
-from streamlit_webrtc import webrtc_streamer, VideoProcessorBase, RTCConfiguration
 import cv2
 import numpy as np
 import tensorflow as tf
-import requests
-import time
-import av
 from collections import deque
 import os
+import time
+from datetime import datetime
+import requests
 
-# --- CONFIGURATION ---
-st.set_page_config(page_title="ResQ AI Vision", page_icon="🚨", layout="wide")
+# ================= CONFIG =================
+MODEL_PATH = "violence_model_epoch_02.tflite"
 
-MODEL_PATH = 'violence_model_epoch_02.tflite'
+FRAME_WIDTH = 128
+FRAME_HEIGHT = 128
+SEQUENCE_LENGTH = 20
+SKIP_FRAMES = 5
+CONFIDENCE_THRESHOLD = 0.30
+
+VIOLENCE_CONFIRM_SECONDS = 2.0
+CAPTURE_INTERVAL_SECONDS = 1.0
+MAX_CAPTURES = 2
+INCIDENT_COOLDOWN_SECONDS = 0
+
+CAPTURE_DIR = "captures"
 API_URL = "https://resq-server.onrender.com/api/violence-detected/"
-CONFIDENCE_THRESHOLD = 0.70
+BEACON_ID = "ab907856-3412-3412-3412-341278563412"
+DEVICE_ID = "AI-VISION-SURVEILLANCE-01"
 
-# --- CACHED MODEL LOADER ---
-@st.cache_resource
-def load_tflite_model():
-    if not os.path.exists(MODEL_PATH):
-        return None
+os.makedirs(CAPTURE_DIR, exist_ok=True)
+
+# ================= API =================
+def send_violence_event(image_paths, confidence_score):
+    files = []
+    for path in image_paths:
+        files.append(
+            ("images", (os.path.basename(path), open(path, "rb"), "image/jpeg"))
+        )
+
+    data = {
+        "beacon_id": BEACON_ID,
+        "confidence_score": f"{confidence_score:.2f}",
+        "description": "Confirmed violent incident – auto captured sequence",
+        "device_id": DEVICE_ID,
+    }
+
     try:
-        interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
-        interpreter.allocate_tensors()
-        return interpreter
+        r = requests.post(API_URL, data=data, files=files, timeout=10)
+        r.raise_for_status()
+        return r.json()
     except Exception as e:
-        print(f"Error loading model: {e}")
+        print("❌ API error:", e)
         return None
 
-# Load model globally so it's shared
-interpreter = load_tflite_model()
+# ================= MODEL =================
+if not os.path.exists(MODEL_PATH):
+    print("❌ Model not found:", MODEL_PATH)
+    exit()
 
-# --- VIDEO PROCESSOR CLASS ---
-# This class runs INSIDE the video stream thread
-class ViolenceDetector(VideoProcessorBase):
-    def __init__(self):
-        self.frames_queue = deque(maxlen=20) # 20 Frame Sequence
-        self.last_alert_time = 0
-        self.alert_cooldown = 5 # Seconds
-        self.interpreter = interpreter
-        self.input_details = self.interpreter.get_input_details()
-        self.output_details = self.interpreter.get_output_details()
-        self.prediction = 0.0
+interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
+interpreter.allocate_tensors()
+input_details = interpreter.get_input_details()
+output_details = interpreter.get_output_details()
 
-    def recv(self, frame: av.VideoFrame) -> av.VideoFrame:
-        # 1. Get image from stream
-        image = frame.to_ndarray(format="bgr24")
-        
-        # 2. Preprocess
-        # Resize to 128x128 for AI
-        resized = cv2.resize(image, (128, 128))
-        normalized = resized / 255.0
-        self.frames_queue.append(normalized)
+def predict(sequence):
+    x = np.expand_dims(np.array(sequence, dtype=np.float32), axis=0)
+    interpreter.set_tensor(input_details[0]["index"], x)
+    interpreter.invoke()
+    return interpreter.get_tensor(output_details[0]["index"])[0][1]
 
-        # 3. Predict (Only if queue is full)
-        if len(self.frames_queue) == 20:
-            # Prepare input
-            input_data = np.array(self.frames_queue, dtype=np.float32)
-            input_data = np.expand_dims(input_data, axis=0)
-            
-            # Run Inference
-            self.interpreter.set_tensor(self.input_details[0]['index'], input_data)
-            self.interpreter.invoke()
-            output_data = self.interpreter.get_tensor(self.output_details[0]['index'])
-            self.prediction = output_data[0][1] # Violence score
+# ================= STATE =================
+frames_queue = deque(maxlen=SEQUENCE_LENGTH)
 
-            # 4. API Alert Logic
-            if self.prediction > CONFIDENCE_THRESHOLD:
-                current_time = time.time()
-                if (current_time - self.last_alert_time) > self.alert_cooldown:
-                    try:
-                        # Send POST in background (simple try/except to not block video)
-                        payload = {
-                            "beacon_id": "ab907856-3412-3412-3412-341278563412",
-                            "confidence_score": float(self.prediction),
-                            "description": "Fight detected via Cloud AI",
-                            "device_id": "STREAMLIT-CLOUD-001"
-                        }
-                        requests.post(API_URL, json=payload, timeout=1)
-                        print(f"🚀 Alert Sent! Score: {self.prediction}")
-                        self.last_alert_time = current_time
-                    except:
-                        pass # Ignore network errors to keep video smooth
+violence_start_time = None
+violence_confirmed = False
+last_capture_time = 0
+capture_count = 0
+captured_images = []
+last_incident_time = 0
 
-        # 5. Draw UI on the frame
-        if self.prediction > CONFIDENCE_THRESHOLD:
-            # Red Box & Text
-            cv2.rectangle(image, (0,0), (640, 50), (0,0,255), -1)
-            cv2.putText(image, f"VIOLENCE: {self.prediction:.1%}", (10, 35), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+# ================= CAMERA =================
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+if not cap.isOpened():
+    print("❌ Webcam not available")
+    exit()
+
+print("📹 Running violence detection — press Q to quit")
+
+frame_count = 0
+current_label = "Initializing..."
+current_color = (255, 255, 255)
+
+# ================= LOOP =================
+while True:
+    ret, frame = cap.read()
+    if not ret:
+        break
+
+    resized = cv2.resize(frame, (FRAME_WIDTH, FRAME_HEIGHT))
+    frames_queue.append(resized / 255.0)
+
+    frame_count += 1
+
+    if len(frames_queue) == SEQUENCE_LENGTH and frame_count % SKIP_FRAMES == 0:
+        score = predict(frames_queue)
+
+        if score > CONFIDENCE_THRESHOLD:
+            current_label = f"⚠️ VIOLENCE ({score:.1%})"
+            current_color = (0, 0, 255)
+
+            if violence_start_time is None:
+                violence_start_time = time.time()
+            elif time.time() - violence_start_time >= VIOLENCE_CONFIRM_SECONDS:
+                violence_confirmed = True
         else:
-            # Green Text
-            cv2.putText(image, f"Safe: {1-self.prediction:.1%}", (10, 35), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+            current_label = f"🟢 Safe ({1-score:.1%})"
+            current_color = (0, 255, 0)
 
-        # Return the annotated frame to the browser
-        return av.VideoFrame.from_ndarray(image, format="bgr24")
+            violence_start_time = None
+            violence_confirmed = False
+            capture_count = 0
+            captured_images.clear()
 
-# --- FRONTEND UI ---
-st.title("🚨 ResQ Cloud Vision")
-st.write("This app runs entirely in the cloud. Click 'Start' and allow camera access.")
+    # ========== CAPTURE ==========
+    if violence_confirmed and capture_count < MAX_CAPTURES:
+        now = time.time()
+        if now - last_capture_time >= CAPTURE_INTERVAL_SECONDS:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = f"{CAPTURE_DIR}/violence_{ts}_{capture_count+1}.jpg"
 
-# WebRTC Streamer
-# This replaces cv2.VideoCapture
-ctx = webrtc_streamer(
-    key="violence-detection",
-    video_processor_factory=ViolenceDetector,
-    rtc_configuration=RTCConfiguration({"iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]}),
-    media_stream_constraints={"video": True, "audio": False},
-    async_processing=True,
-)
+            cv2.imwrite(path, frame)
+            captured_images.append(path)
+            capture_count += 1
+            last_capture_time = now
 
-# Status indicators
-if ctx.state.playing:
-    st.success("✅ Monitoring Active")
-    st.info("The AI is processing frames. Violence > 80% triggers the API.")
+            print("📸 Captured:", path)
+
+            if capture_count == MAX_CAPTURES:
+                if now - last_incident_time >= INCIDENT_COOLDOWN_SECONDS:
+                    print("🚨 Sending incident to backend...")
+                    result = send_violence_event(captured_images, score)
+                    if result:
+                        incident_id = result.get("incident_id")
+                        status = result.get("status", "unknown")
+
+                        if incident_id:
+                            print(f"✅ Incident created successfully | ID: {incident_id}")
+                            last_incident_time = now
+                        else:
+                            print("⚠️ Incident response received but no incident_id")
+                            print("🔎 Full response:", result)
+
+
+                # HARD RESET
+                violence_confirmed = False
+                violence_start_time = None
+                capture_count = 0
+                captured_images.clear()
+
+    # ========== UI ==========
+    cv2.rectangle(frame, (0, 0), (640, 60), (0, 0, 0), -1)
+    cv2.putText(frame, current_label, (20, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, current_color, 2)
+
+    cv2.imshow("Violence Detection", frame)
+    if cv2.waitKey(1) & 0xFF == ord("q"):
+        break
+
+cap.release()
+cv2.destroyAllWindows()
