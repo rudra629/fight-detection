@@ -9,10 +9,10 @@ from datetime import datetime
 import requests
 import tempfile
 import threading
-from streamlit_webrtc import webrtc_streamer, VideoTransformerBase
 import av
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, WebRtcMode
 
-# ================= CONFIG =================
+# ================= CONFIGURATION =================
 MODEL_PATH = "violence_model_epoch_02.tflite"
 
 # Detection Constants
@@ -39,18 +39,24 @@ os.makedirs(CAPTURE_DIR, exist_ok=True)
 @st.cache_resource
 def load_model():
     if not os.path.exists(MODEL_PATH):
+        st.error(f"❌ Model file not found: {MODEL_PATH}")
         return None, None, None
     
-    interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
-    interpreter.allocate_tensors()
-    input_details = interpreter.get_input_details()
-    output_details = interpreter.get_output_details()
-    return interpreter, input_details, output_details
+    try:
+        interpreter = tf.lite.Interpreter(model_path=MODEL_PATH)
+        interpreter.allocate_tensors()
+        input_details = interpreter.get_input_details()
+        output_details = interpreter.get_output_details()
+        return interpreter, input_details, output_details
+    except Exception as e:
+        st.error(f"❌ Error loading model: {e}")
+        return None, None, None
 
 interpreter, input_details, output_details = load_model()
 
+# ================= API HANDLER =================
 def run_api_call(image_paths, score):
-    """Runs the API call in a separate thread to avoid freezing video."""
+    """Runs API call in background thread."""
     try:
         files = []
         open_files = []
@@ -74,10 +80,9 @@ def run_api_call(image_paths, score):
         for f in open_files:
             f.close()
 
-# ================= VIDEO PROCESSOR (WebRTC) =================
+# ================= VIDEO PROCESSOR =================
 class ViolenceProcessor(VideoTransformerBase):
     def __init__(self):
-        # Initialize state specifically for this video session
         self.frames_queue = deque(maxlen=SEQUENCE_LENGTH)
         self.violence_start_time = None
         self.violence_confirmed = False
@@ -87,38 +92,39 @@ class ViolenceProcessor(VideoTransformerBase):
         self.last_incident_time = 0
 
     def recv(self, frame):
-        # 1. Convert WebRTC frame to OpenCV format (BGR)
+        # 1. Convert WebRTC frame to BGR (OpenCV format)
         img = frame.to_ndarray(format="bgr24")
         
-        # 2. Preprocess
-        # Model expects RGB
+        # 2. Preprocess for Model (RGB -> Resize -> Normalize)
         img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         resized = cv2.resize(img_rgb, (FRAME_WIDTH, FRAME_HEIGHT))
         normalized = resized / 255.0
         
         self.frames_queue.append(normalized)
 
-        # UI Defaults
-        label = "Initializing..."
+        # Defaults
+        label = "Scanning..."
         color = (255, 255, 0) # Cyan
         score = 0.0
 
-        # 3. Prediction
+        # 3. Prediction Logic
         if len(self.frames_queue) == SEQUENCE_LENGTH:
-            # Run inference
             if interpreter:
+                # Prepare Input
                 x = np.expand_dims(np.array(self.frames_queue, dtype=np.float32), axis=0)
+                
+                # Run Inference
                 interpreter.set_tensor(input_details[0]["index"], x)
                 interpreter.invoke()
                 output_data = interpreter.get_tensor(output_details[0]["index"])
                 
-                # Handle output shape
+                # Parse Output
                 if output_data.shape[-1] > 1:
                     score = output_data[0][1]
                 else:
                     score = output_data[0][0]
 
-            # 4. Logic
+            # 4. Violence Logic
             if score > CONFIDENCE_THRESHOLD:
                 label = f"⚠️ VIOLENCE ({score:.1%})"
                 color = (0, 0, 255) # Red
@@ -130,32 +136,31 @@ class ViolenceProcessor(VideoTransformerBase):
             else:
                 label = f"🟢 Safe ({1-score:.1%})"
                 color = (0, 255, 0) # Green
-                # Reset triggers
                 self.violence_start_time = None
                 self.violence_confirmed = False
                 self.capture_count = 0
                 self.captured_images = []
 
-        # 5. Capture & Alert
+        # 5. Capture & Alert Logic
         if self.violence_confirmed and self.capture_count < MAX_CAPTURES:
             now = time.time()
             if now - self.last_incident_time > INCIDENT_COOLDOWN_SECONDS:
                 if now - self.last_capture_time >= CAPTURE_INTERVAL_SECONDS:
-                    # Save locally
+                    # Save Image
                     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
                     filename = f"violence_{ts}_{self.capture_count+1}.jpg"
                     path = os.path.join(CAPTURE_DIR, filename)
-                    cv2.imwrite(path, img) # Save BGR original
+                    cv2.imwrite(path, img) # Save original BGR
                     
                     self.captured_images.append(path)
                     self.capture_count += 1
                     self.last_capture_time = now
                     
-                    # Visual Feedback
+                    # On-Screen Feedback
                     cv2.putText(img, f"CAPTURING EVIDENCE {self.capture_count}/{MAX_CAPTURES}", 
                                (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-                    # Trigger API in background thread (so video doesn't freeze)
+                    # Send Alert
                     if self.capture_count == MAX_CAPTURES:
                         self.last_incident_time = now
                         t = threading.Thread(target=run_api_call, args=(list(self.captured_images), score))
@@ -167,28 +172,41 @@ class ViolenceProcessor(VideoTransformerBase):
                         self.capture_count = 0
                         self.captured_images = []
 
-        # 6. Draw UI
+        # 6. Draw Overlay
         cv2.rectangle(img, (0, 0), (600, 50), (0, 0, 0), -1)
         cv2.putText(img, label, (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
 
-        # Return the processed frame to the browser
+        # Return frame to browser
         return av.VideoFrame.from_ndarray(img, format="bgr24")
 
 # ================= MAIN UI =================
+st.set_page_config(page_title="AI Violence Detector", page_icon="🛡️")
 st.title("🛡️ AI Violence Detection System")
-st.sidebar.header("Configuration")
+
+st.sidebar.header("Settings")
 input_source = st.sidebar.radio("Select Input Source:", ("Webcam (Live)", "Upload Video File"))
+
+# --- WEB RTC CONFIGURATION (STUN SERVERS) ---
+# This block is crucial for fixing the "Connection taking too long" error
+RTC_CONFIGURATION = {
+    "iceServers": [
+        {"urls": ["stun:stun.l.google.com:19302"]},
+        {"urls": ["stun:stun1.l.google.com:19302"]},
+        {"urls": ["stun:stun2.l.google.com:19302"]},
+    ]
+}
 
 if input_source == "Webcam (Live)":
     st.write("Permissions: Allow your browser to access the camera.")
     
-    # This component handles the browser->server streaming
+    # Run the streamer
     webrtc_streamer(
         key="violence-detection",
         video_processor_factory=ViolenceProcessor,
-        rtc_configuration={
-            "iceServers": [{"urls": ["stun:stun.l.google.com:19302"]}]
-        }
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration=RTC_CONFIGURATION,
+        media_stream_constraints={"video": True, "audio": False},
+        async_processing=True,
     )
 
 elif input_source == "Upload Video File":
@@ -201,7 +219,7 @@ elif input_source == "Upload Video File":
         cap = cv2.VideoCapture(tfile.name)
         stframe = st.empty()
         
-        # Reuse the processor logic logic manually for files
+        # We manually use the processor class for files
         processor = ViolenceProcessor()
         
         while cap.isOpened():
@@ -209,21 +227,36 @@ elif input_source == "Upload Video File":
             if not ret:
                 break
             
-            # Mimic the WebRTC recv flow
-            # Create a dummy AV frame to reuse the class logic or just copy logic
-            # For simplicity, let's just create a quick loop here:
+            # Mimic WebRTC flow: Create AV Frame -> Recv -> Convert back
+            # (We skip AV conversion for speed here and just use the logic)
             
-            # (Reuse preprocessing logic from class for consistency)
+            # 1. Preprocess logic manual copy
             img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             resized = cv2.resize(img_rgb, (FRAME_WIDTH, FRAME_HEIGHT))
             normalized = resized / 255.0
             processor.frames_queue.append(normalized)
+
+            label = "Scanning..."
+            color = (0, 255, 0)
             
-            # ... (Logic is identical to WebRTC recv) ...
-            # To keep code clean, just know file upload runs locally on server perfectly fine.
-            # You can paste the "process_frame" logic from your previous code here if needed.
+            if len(processor.frames_queue) == SEQUENCE_LENGTH:
+                x = np.expand_dims(np.array(processor.frames_queue, dtype=np.float32), axis=0)
+                interpreter.set_tensor(input_details[0]["index"], x)
+                interpreter.invoke()
+                output_data = interpreter.get_tensor(output_details[0]["index"])
+                
+                score = output_data[0][1] if output_data.shape[-1] > 1 else output_data[0][0]
+                
+                if score > CONFIDENCE_THRESHOLD:
+                    label = f"⚠️ VIOLENCE ({score:.1%})"
+                    color = (0, 0, 255)
+                else:
+                    label = f"🟢 Safe ({1-score:.1%})"
+
+            # Draw
+            cv2.rectangle(frame, (0, 0), (600, 50), (0, 0, 0), -1)
+            cv2.putText(frame, label, (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
             
-            # Simple display for file upload
             stframe.image(frame, channels="BGR")
             
         cap.release()
