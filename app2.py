@@ -224,7 +224,7 @@ if input_source == "Webcam (Live)":
     
     if run:
         # Use OpenCV for continuous frame capture
-        cap = cv2.VideoCapture(0)
+        cap = cv2.VideoCapture(1)
         
         while run:
             ret, frame = cap.read()
