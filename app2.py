@@ -11,7 +11,7 @@ import tempfile
 
 # ================= CONFIG =================
 # Ensure this matches your model filename exactly
-MODEL_PATH = "violence_model_epoch_02.tflite"
+MODEL_PATH = "violence_model_epoch_02_NEW.tflite"
 
 # Detection Constants
 FRAME_WIDTH = 128
